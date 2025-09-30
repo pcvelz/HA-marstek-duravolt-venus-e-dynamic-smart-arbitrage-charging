@@ -2,9 +2,6 @@
 
 
 Home Assistant script that processes dynamic electricity tariffs to plan manual charging on cheapest and manual discharging on expensive hours.
- 
-
-<img src="docs/Marstek-app-manual-schedule.jpeg" width="400px" />
 
 **Important note:** This code is still a proof-of-concept of the purpose of learning to control the Venus-E. Use at own risk, the only purpose is for personal study and beta testing and currently one Venus-E plug-in battery is supported.
 
@@ -21,7 +18,14 @@ Optionally:
 
 ## Loading the Venus-E arbitrage charging script
 
-The smart charging scripts and entities will be created by copying the [marstek_battery_control.yaml](home-assistant/config/packages/marstek_battery_control.yaml) YAML to `/config/packages/marstek_battery_control.yaml` on HA.
+If not set-up already, setup in `/homeassistant/configuration.yaml` the following lines to load packages from `./packages` directory:
+
+```yaml
+homeassistant:
+  packages: !include_dir_named packages
+```
+
+The smart charging scripts and entities will be created by copying the [marstek_battery_control.yaml](home-assistant/config/packages/marstek_battery_control.yaml) YAML to `/homeassistant/packages/marstek_battery_control.yaml` on HA.
 
 ![](docs/HA-file-editor.png)
 
@@ -35,6 +39,9 @@ Currently the YAML config is set to retrieve dynamnic tarrifs from the HA entity
 
 <img src="docs/HA-electricity-tariffs.jpeg" width="400px" />
 
+The script plans the (dis)charging accordingly
+
+<img src="docs/Marstek-app-manual-schedule.jpeg" width="400px" />
 
 ### Venus-E entity ID
 ```yaml
