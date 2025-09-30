@@ -1,0 +1,819 @@
+### FILE: /config/packages/marstek_battery_control.yaml
+
+# Configuration variables at the top for easy modification
+input_text:
+  marstek_device_prefix:
+    name: "Marstek Device Prefix"
+    initial: "hame_energy_hmg_50_XXXXXXXXXXXX"
+
+# Main control script that determines optimal charging/discharging windows
+script:
+  marstek_battery_main_control:
+    alias: "Marstek Battery Main Control"
+    sequence:
+      - variables:
+          # Device prefix from input_text
+          device_prefix: "{{ states('input_text.marstek_device_prefix') }}"
+
+          # Calculate spread threshold based on RTE and margin
+          # 80% RTE means 20% loss, plus margin for costs
+          # If buy at 15ct, need to sell at minimum 15/0.8 = 18.75ct (25% higher)
+          # Add ~5% margin for fees/costs = 30% total spread required
+          spread_threshold_percent: 30
+
+          # Get current hour for day split logic
+          current_hour: "{{ now().hour }}"
+
+          # Check if tomorrow's prices are available
+          has_tomorrow: "{{ is_state('binary_sensor.tomorrow_prices_available', 'on') }}"
+
+          # Today's price windows
+          today_morning_cheap: >
+            {% from 'cheapest_energy_hours.jinja' import cheapest_energy_hours %}
+            {% set result = cheapest_energy_hours(
+              sensor='sensor.zonneplan_current_electricity_tariff',
+              attr_all='forecast',
+              time_key='datetime',
+              value_key='electricity_price',
+              hours=1,
+              mode='min',
+              start=(now().replace(hour=0, minute=0, second=0, microsecond=0)),
+              end=(now().replace(hour=6, minute=0, second=0, microsecond=0))
+            ) | from_json %}
+            {{ result.list[0] if result.list is defined and result.list | length > 0 else 999999999 }}
+
+          today_morning_expensive: >
+            {% from 'cheapest_energy_hours.jinja' import cheapest_energy_hours %}
+            {% set result = cheapest_energy_hours(
+              sensor='sensor.zonneplan_current_electricity_tariff',
+              attr_all='forecast',
+              time_key='datetime',
+              value_key='electricity_price',
+              hours=1,
+              mode='max',
+              start=(now().replace(hour=6, minute=0, second=0, microsecond=0)),
+              end=(now().replace(hour=9, minute=0, second=0, microsecond=0))
+            ) | from_json %}
+            {{ result.list[0] if result.list is defined and result.list | length > 0 else 0 }}
+
+          today_afternoon_cheap: >
+            {% from 'cheapest_energy_hours.jinja' import cheapest_energy_hours %}
+            {% set result = cheapest_energy_hours(
+              sensor='sensor.zonneplan_current_electricity_tariff',
+              attr_all='forecast',
+              time_key='datetime',
+              value_key='electricity_price',
+              hours=1,
+              mode='min',
+              start=(now().replace(hour=9, minute=0, second=0, microsecond=0)),
+              end=(now().replace(hour=18, minute=0, second=0, microsecond=0))
+            ) | from_json %}
+            {{ result.list[0] if result.list is defined and result.list | length > 0 else 999999999 }}
+
+          today_evening_expensive: >
+            {% from 'cheapest_energy_hours.jinja' import cheapest_energy_hours %}
+            {% set result = cheapest_energy_hours(
+              sensor='sensor.zonneplan_current_electricity_tariff',
+              attr_all='forecast',
+              time_key='datetime',
+              value_key='electricity_price',
+              hours=1,
+              mode='max',
+              start=(now().replace(hour=18, minute=0, second=0, microsecond=0)),
+              end=(now().replace(hour=22, minute=0, second=0, microsecond=0))
+            ) | from_json %}
+            {{ result.list[0] if result.list is defined and result.list | length > 0 else 0 }}
+
+          # Tomorrow's price windows (if available)
+          tomorrow_morning_cheap: >
+            {% if has_tomorrow %}
+              {% from 'cheapest_energy_hours.jinja' import cheapest_energy_hours %}
+              {% set result = cheapest_energy_hours(
+                sensor='sensor.zonneplan_current_electricity_tariff',
+                attr_all='forecast',
+                time_key='datetime',
+                value_key='electricity_price',
+                hours=1,
+                mode='min',
+                start=(now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)),
+                end=(now().replace(hour=6, minute=0, second=0, microsecond=0) + timedelta(days=1))
+              ) | from_json %}
+              {{ result.list[0] if result.list is defined and result.list | length > 0 else 999999999 }}
+            {% else %}
+              {{ 'unavailable' }}
+            {% endif %}
+
+          tomorrow_morning_expensive: >
+            {% if has_tomorrow %}
+              {% from 'cheapest_energy_hours.jinja' import cheapest_energy_hours %}
+              {% set result = cheapest_energy_hours(
+                sensor='sensor.zonneplan_current_electricity_tariff',
+                attr_all='forecast',
+                time_key='datetime',
+                value_key='electricity_price',
+                hours=1,
+                mode='max',
+                start=(now().replace(hour=6, minute=0, second=0, microsecond=0) + timedelta(days=1)),
+                end=(now().replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1))
+              ) | from_json %}
+              {{ result.list[0] if result.list is defined and result.list | length > 0 else 0 }}
+            {% else %}
+              {{ 'unavailable' }}
+            {% endif %}
+
+          # Calculate spread required (30% = buy price * 1.3)
+          spread_multiplier: "{{ 1 + (spread_threshold_percent / 100) }}"
+
+          # Calculate optimal spread scenarios
+          today_cheap: "{{ [today_morning_cheap, today_afternoon_cheap] | min }}"
+          today_expensive: "{{ [today_morning_expensive, today_evening_expensive] | max }}"
+
+          # Check if today's spread meets threshold
+          today_spread_ok: >
+            {% set cheap = today_cheap | float %}
+            {% set expensive = today_expensive | float %}
+            {{ expensive >= (cheap * spread_multiplier | float) }}
+
+          # Check tomorrow's spread if available
+          tomorrow_spread_ok: >
+            {% if has_tomorrow and tomorrow_morning_cheap != 'unavailable' %}
+              {% set cheap = tomorrow_morning_cheap | float %}
+              {% set expensive = tomorrow_morning_expensive | float %}
+              {{ expensive >= (cheap * spread_multiplier | float) }}
+            {% else %}
+              {{ false }}
+            {% endif %}
+
+          # Check cross-day spread (with RTE consideration)
+          cross_day_spread_ok: >
+            {% if has_tomorrow and tomorrow_morning_expensive != 'unavailable' %}
+              {% set today_cheap_price = today_cheap | float %}
+              {% set tomorrow_expensive_price = tomorrow_morning_expensive | float %}
+              {# Account for 80% RTE, so need even higher spread #}
+              {{ tomorrow_expensive_price >= (today_cheap_price * spread_multiplier * 1.25) }}
+            {% else %}
+              {{ false }}
+            {% endif %}
+
+          # Determine optimal strategy
+          optimal_strategy: >
+            {% if current_hour < 14 %}
+              {% if today_spread_ok %}
+                'today_only'
+              {% else %}
+                'wait'
+              {% endif %}
+            {% else %}
+              {% if has_tomorrow %}
+                {% if cross_day_spread_ok and not today_spread_ok %}
+                  'cross_day'
+                {% elif tomorrow_spread_ok and not today_spread_ok %}
+                  'tomorrow_only'
+                {% elif today_spread_ok %}
+                  'today_only'
+                {% else %}
+                  'wait'
+                {% endif %}
+              {% else %}
+                {% if today_spread_ok %}
+                  'today_only'
+                {% else %}
+                  'wait'
+                {% endif %}
+              {% endif %}
+            {% endif %}
+
+          # Set planning window based on strategy
+          planning_start: >
+            {% if optimal_strategy == 'tomorrow_only' %}
+              {{ (now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat() }}
+            {% elif optimal_strategy == 'cross_day' %}
+              {{ now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() }}
+            {% else %}
+              {{ now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() }}
+            {% endif %}
+
+          planning_end: >
+            {% if optimal_strategy == 'cross_day' %}
+              {{ (now().replace(hour=23, minute=59, second=59, microsecond=999999) + timedelta(days=1)).isoformat() }}
+            {% elif optimal_strategy == 'tomorrow_only' %}
+              {{ (now().replace(hour=23, minute=59, second=59, microsecond=999999) + timedelta(days=1)).isoformat() }}
+            {% else %}
+              {{ now().replace(hour=23, minute=59, second=59, microsecond=999999).isoformat() }}
+            {% endif %}
+
+      # Log main control decision
+      - service: system_log.write
+        data:
+          message: >
+            Marstek Main Control:
+            - Strategy: {{ optimal_strategy }}
+            - Today spread OK: {{ today_spread_ok }}
+            - Tomorrow spread OK: {{ tomorrow_spread_ok }}
+            - Cross-day spread OK: {{ cross_day_spread_ok }}
+            - Planning: {{ planning_start }} to {{ planning_end }}
+          level: info
+
+      # Only proceed if strategy is not 'wait'
+      - condition: template
+        value_template: "{{ optimal_strategy != 'wait' }}"
+
+      # Call the charging schedule script with parameters
+      - service: script.dynamic_charging_schedule
+        data:
+          planning_start: "{{ planning_start }}"
+          planning_end: "{{ planning_end }}"
+          device_prefix: "{{ device_prefix }}"
+
+  # Script to set a single schedule with retry logic
+  set_schedule_period:
+    alias: "Set Schedule Period with Retry"
+    mode: parallel
+    max: 8
+    fields:
+      device_prefix:
+        description: "Device prefix"
+        required: true
+      schedule_index:
+        description: "Schedule index (0-7)"
+        required: true
+      time_from:
+        description: "Start time HH:MM"
+        required: false
+      time_to:
+        description: "End time HH:MM"
+        required: false
+      power:
+        description: "Power setting in watts"
+        required: false
+      weekday:
+        description: "Day of week (0-6)"
+        required: false
+      enabled:
+        description: "Enable/disable schedule"
+        required: true
+      delay_seconds:
+        description: "Delay between operations"
+        default: 4
+    sequence:
+      - variables:
+          retry_count: 0
+          max_retries: 3
+
+      # Try up to max_retries times
+      - repeat:
+          while:
+            - condition: template
+              value_template: "{{ retry_count < max_retries }}"
+          sequence:
+            - variables:
+                retry_count: "{{ retry_count + 1 }}"
+                needs_update: false
+
+            # Check and set time_from if needed
+            - if:
+                - condition: template
+                  value_template: "{{ time_from is defined }}"
+                - condition: template
+                  value_template: "{{ states('text.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_time_from') != time_from }}"
+              then:
+                - service: text.set_value
+                  target:
+                    entity_id: "text.{{ device_prefix }}_time_period_{{ schedule_index }}_time_from"
+                  data:
+                    value: "{{ time_from }}"
+                - variables:
+                    needs_update: true
+                - delay:
+                    seconds: "{{ delay_seconds }}"
+
+            # Check and set time_to if needed
+            - if:
+                - condition: template
+                  value_template: "{{ time_to is defined }}"
+                - condition: template
+                  value_template: "{{ states('text.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_time_to') != time_to }}"
+              then:
+                - service: text.set_value
+                  target:
+                    entity_id: "text.{{ device_prefix }}_time_period_{{ schedule_index }}_time_to"
+                  data:
+                    value: "{{ time_to }}"
+                - variables:
+                    needs_update: true
+                - delay:
+                    seconds: "{{ delay_seconds }}"
+
+            # Check and set power if needed
+            - if:
+                - condition: template
+                  value_template: "{{ power is defined }}"
+                - condition: template
+                  value_template: "{{ states('number.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_power') | int != power | int }}"
+              then:
+                - service: number.set_value
+                  target:
+                    entity_id: "number.{{ device_prefix }}_time_period_{{ schedule_index }}_power"
+                  data:
+                    value: "{{ power }}"
+                - variables:
+                    needs_update: true
+                - delay:
+                    seconds: "{{ delay_seconds }}"
+
+            # Check and set weekday if needed
+            - if:
+                - condition: template
+                  value_template: "{{ weekday is defined }}"
+                - condition: template
+                  value_template: "{{ states('text.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_weekday') != weekday | string }}"
+              then:
+                - service: text.set_value
+                  target:
+                    entity_id: "text.{{ device_prefix }}_time_period_{{ schedule_index }}_weekday"
+                  data:
+                    value: "{{ weekday }}"
+                - variables:
+                    needs_update: true
+                - delay:
+                    seconds: "{{ delay_seconds }}"
+
+            # Check and set enabled state if needed
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ enabled }}"
+                    - condition: template
+                      value_template: "{{ is_state('switch.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_enabled', 'off') }}"
+                  sequence:
+                    - service: switch.turn_on
+                      target:
+                        entity_id: "switch.{{ device_prefix }}_time_period_{{ schedule_index }}_enabled"
+                    - delay:
+                        seconds: "{{ delay_seconds }}"
+                - conditions:
+                    - condition: template
+                      value_template: "{{ not enabled }}"
+                    - condition: template
+                      value_template: "{{ is_state('switch.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_enabled', 'on') }}"
+                  sequence:
+                    - service: switch.turn_off
+                      target:
+                        entity_id: "switch.{{ device_prefix }}_time_period_{{ schedule_index }}_enabled"
+                    - delay:
+                        seconds: "{{ delay_seconds }}"
+
+            # Verify all settings are correct
+            - variables:
+                time_from_ok: "{{ not time_from is defined or states('text.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_time_from') == time_from }}"
+                time_to_ok: "{{ not time_to is defined or states('text.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_time_to') == time_to }}"
+                power_ok: "{{ not power is defined or states('number.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_power') | int == power | int }}"
+                weekday_ok: "{{ not weekday is defined or states('text.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_weekday') == weekday | string }}"
+                enabled_ok: "{{ (enabled and is_state('switch.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_enabled', 'on')) or (not enabled and is_state('switch.' ~ device_prefix ~ '_time_period_' ~ schedule_index ~ '_enabled', 'off')) }}"
+
+            # If all settings are correct, exit the retry loop
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ time_from_ok and time_to_ok and power_ok and weekday_ok and enabled_ok }}"
+                  sequence:
+                    - variables:
+                        retry_count: "{{ max_retries }}"
+              default:
+                # Wait before retry
+                - delay:
+                    seconds: "{{ delay_seconds * 2 }}"
+
+  # Updated charging schedule script
+  dynamic_charging_schedule:
+    alias: "Marstek Battery Dynamic Charging Schedule"
+    fields:
+      planning_start:
+        description: "Start datetime for planning window"
+        required: true
+      planning_end:
+        description: "End datetime for planning window"
+        required: true
+      device_prefix:
+        description: "Device prefix for entities"
+        required: true
+    sequence:
+      - variables:
+          price_delta_threshold_percent: 2.8
+          delay_seconds_between_actions: 4
+
+          price_data: >
+            {% from 'cheapest_energy_hours.jinja' import cheapest_energy_hours %}
+            {% set sensor = 'sensor.zonneplan_current_electricity_tariff' %}
+            {% set all_hours = cheapest_energy_hours(
+              sensor=sensor, 
+              attr_all='forecast', 
+              time_key='datetime', 
+              value_key='electricity_price', 
+              hours='all',
+              mode='all',
+              start=planning_start | as_datetime,
+              end=planning_end | as_datetime
+            ) | from_json %}
+            {% set ns = namespace(sorted_hours=[]) %}
+            {% for i in range(all_hours.list | length) %}
+              {% set hour_data = {
+                'datetime': (all_hours.start | as_datetime + timedelta(hours=i)).isoformat(),
+                'price': all_hours.list[i]
+              } %}
+              {% set ns.sorted_hours = ns.sorted_hours + [hour_data] %}
+            {% endfor %}
+            {{ ns.sorted_hours | sort(attribute='price') }}
+
+          price_spread: >
+            {% set prices = price_data %}
+            {% if prices | length > 0 %}
+              {{ ((prices[-1].price - prices[0].price) / 10000000) | round(4) }}
+            {% else %}
+              0
+            {% endif %}
+
+          cheap_hours_count: >
+            {% set prices = price_data %}
+            {% set threshold = price_delta_threshold_percent %}
+            {% if prices | length >= 4 %}
+              {% set cheapest = prices[0].price %}
+              {% set second = prices[1].price %}
+              {% set third = prices[2].price %}
+              {% set fourth = prices[3].price %}
+              {% set diff_3_2 = ((third - second) / second * 100) if second > 0 else 100 %}
+              {% set diff_4_3 = ((fourth - third) / third * 100) if third > 0 else 100 %}
+              {% if diff_3_2 <= threshold and diff_4_3 <= threshold %}
+                4
+              {% elif diff_3_2 <= threshold %}
+                3
+              {% else %}
+                2
+              {% endif %}
+            {% elif prices | length >= 3 %}
+              {% set cheapest = prices[0].price %}
+              {% set second = prices[1].price %}
+              {% set third = prices[2].price %}
+              {% set diff_3_2 = ((third - second) / second * 100) if second > 0 else 100 %}
+              {% if diff_3_2 <= threshold %}
+                3
+              {% else %}
+                2
+              {% endif %}
+            {% elif prices | length >= 2 %}
+              2
+            {% else %}
+              0
+            {% endif %}
+
+          selected_hours: >
+            {% set prices = price_data %}
+            {% set count = cheap_hours_count | int %}
+            {{ prices[:count] if count > 0 else [] }}
+
+          charging_speeds: >
+            {% set count = cheap_hours_count | int %}
+            {% if count == 4 %}
+              [-1500, -1500, -1500, -1500]
+            {% elif count == 3 %}
+              [-2005, -2005, -2005]
+            {% elif count == 2 %}
+              {% set prices = selected_hours %}
+              {% if prices | length >= 2 %}
+                {% set first = prices[0].price %}
+                {% set second = prices[1].price %}
+                {% set diff = ((second - first) / first * 100) if first > 0 else 100 %}
+                {% if diff < price_delta_threshold_percent %}
+                  [-2300, -2300]
+                {% else %}
+                  [-2500, -2005]
+                {% endif %}
+              {% else %}
+                [-2500, -2005]
+              {% endif %}
+            {% else %}
+              []
+            {% endif %}
+
+          expensive_hours_count: >
+            {% set prices = price_data | reverse | list %}
+            {% set threshold = price_delta_threshold_percent %}
+            {% if prices | length >= 4 %}
+              {% set most_expensive = prices[0].price %}
+              {% set second = prices[1].price %}
+              {% set third = prices[2].price %}
+              {% set fourth = prices[3].price %}
+              {% set diff_3_2 = ((second - third) / third * 100) if third > 0 else 100 %}
+              {% set diff_4_3 = ((third - fourth) / fourth * 100) if fourth > 0 else 100 %}
+              {% if diff_3_2 <= threshold and diff_4_3 <= threshold %}
+                4
+              {% elif diff_3_2 <= threshold %}
+                3
+              {% else %}
+                2
+              {% endif %}
+            {% elif prices | length >= 3 %}
+              {% set most_expensive = prices[0].price %}
+              {% set second = prices[1].price %}
+              {% set third = prices[2].price %}
+              {% set diff_3_2 = ((second - third) / third * 100) if third > 0 else 100 %}
+              {% if diff_3_2 <= threshold %}
+                3
+              {% else %}
+                2
+              {% endif %}
+            {% elif prices | length >= 2 %}
+              2
+            {% else %}
+              0
+            {% endif %}
+
+          selected_expensive_hours: >
+            {% set prices = price_data | reverse | list %}
+            {% set count = expensive_hours_count | int %}
+            {{ prices[:count] if count > 0 else [] }}
+
+          discharging_speeds: >
+            {% set count = expensive_hours_count | int %}
+            {% if count == 4 %}
+              [1500, 1500, 1500, 1500]
+            {% elif count == 3 %}
+              [2005, 2005, 2005]
+            {% elif count == 2 %}
+              {% set prices = selected_expensive_hours %}
+              {% if prices | length >= 2 %}
+                {% set first = prices[0].price %}
+                {% set second = prices[1].price %}
+                {% set diff = ((first - second) / second * 100) if second > 0 else 100 %}
+                {% if diff < price_delta_threshold_percent %}
+                  [2300, 2300]
+                {% else %}
+                  [2500, 2005]
+                {% endif %}
+              {% else %}
+                [2500, 2005]
+              {% endif %}
+            {% else %}
+              []
+            {% endif %}
+
+          last_cheap_hour_datetime: >
+            {% set hours = selected_hours %}
+            {% if hours | length > 0 %}
+              {% set ns = namespace(times=[]) %}
+              {% for h in hours %}
+                {% set ns.times = ns.times + [(h.datetime | as_datetime, h.datetime)] %}
+              {% endfor %}
+              {% set sorted_times = ns.times | sort(attribute=0) %}
+              {{ sorted_times[-1][1] if sorted_times else none }}
+            {% else %}
+              {{ none }}
+            {% endif %}
+
+          first_cheap_hour_datetime: >
+            {% set hours = selected_hours %}
+            {% if hours | length > 0 %}
+              {% set ns = namespace(times=[]) %}
+              {% for h in hours %}
+                {% set ns.times = ns.times + [(h.datetime | as_datetime, h.datetime)] %}
+              {% endfor %}
+              {% set sorted_times = ns.times | sort(attribute=0) %}
+              {{ sorted_times[0][1] if sorted_times else none }}
+            {% else %}
+              {{ none }}
+            {% endif %}
+
+          last_expensive_hour_datetime: >
+            {% set hours = selected_expensive_hours %}
+            {% if hours | length > 0 %}
+              {% set ns = namespace(times=[]) %}
+              {% for h in hours %}
+                {% set ns.times = ns.times + [(h.datetime | as_datetime, h.datetime)] %}
+              {% endfor %}
+              {% set sorted_times = ns.times | sort(attribute=0) %}
+              {{ sorted_times[-1][1] if sorted_times else none }}
+            {% else %}
+              {{ none }}
+            {% endif %}
+
+          first_expensive_hour_datetime: >
+            {% set hours = selected_expensive_hours %}
+            {% if hours | length > 0 %}
+              {% set ns = namespace(times=[]) %}
+              {% for h in hours %}
+                {% set ns.times = ns.times + [(h.datetime | as_datetime, h.datetime)] %}
+              {% endfor %}
+              {% set sorted_times = ns.times | sort(attribute=0) %}
+              {{ sorted_times[0][1] if sorted_times else none }}
+            {% else %}
+              {{ none }}
+            {% endif %}
+
+      # Log schedule planning
+      - service: system_log.write
+        data:
+          message: >
+            Marstek Schedule Planning:
+            - Window: {{ planning_start }} to {{ planning_end }}
+            - Price spread: {{ price_spread }} EUR
+            - Charging: {{ cheap_hours_count }} hours, speeds {{ charging_speeds }}
+            - Discharging: {{ expensive_hours_count }} hours, speeds {{ discharging_speeds }}
+          level: info
+
+      # Clear all schedules first
+      - repeat:
+          count: 8
+          sequence:
+            - service: script.set_schedule_period
+              data:
+                device_prefix: "{{ device_prefix }}"
+                schedule_index: "{{ repeat.index - 1 }}"
+                enabled: false
+                delay_seconds: "{{ delay_seconds_between_actions }}"
+
+      # Configure charging schedules
+      - repeat:
+          count: "{{ cheap_hours_count | int }}"
+          sequence:
+            - variables:
+                hour_data: "{{ selected_hours[repeat.index - 1] }}"
+                hour_datetime: "{{ hour_data.datetime | as_datetime }}"
+                schedule_index: "{{ repeat.index - 1 }}"
+                charging_speed: "{{ charging_speeds[repeat.index - 1] }}"
+                is_last_hour: "{{ hour_data.datetime == last_cheap_hour_datetime }}"
+                time_from: "{{ ((hour_data.datetime | as_datetime) - timedelta(minutes=1)).strftime('%H:%M') }}"
+                time_to_raw: "{{ ((hour_data.datetime | as_datetime) + timedelta(hours=1) - timedelta(minutes=1)).strftime('%H:%M') }}"
+                time_to: "{{ ((hour_data.datetime | as_datetime) + timedelta(hours=1) + timedelta(minutes=20)).strftime('%H:%M') if is_last_hour else time_to_raw }}"
+                schedule_weekday: "{{ (hour_data.datetime | as_datetime).weekday() }}"
+
+            - service: script.set_schedule_period
+              data:
+                device_prefix: "{{ device_prefix }}"
+                schedule_index: "{{ schedule_index }}"
+                time_from: "{{ time_from }}"
+                time_to: "{{ time_to }}"
+                power: "{{ charging_speed }}"
+                weekday: "{{ schedule_weekday }}"
+                enabled: true
+                delay_seconds: "{{ delay_seconds_between_actions }}"
+
+            - service: system_log.write
+              data:
+                message: >
+                  Schedule {{ schedule_index }} CHARGE:
+                  {{ time_from }}-{{ time_to }}, 
+                  {{ (hour_data.price / 10000000) | round(4) }} EUR,
+                  {{ charging_speed }}W
+                level: info
+
+      # Configure discharging schedules
+      - repeat:
+          count: "{{ expensive_hours_count | int }}"
+          sequence:
+            - variables:
+                hour_data: "{{ selected_expensive_hours[repeat.index - 1] }}"
+                hour_datetime: "{{ hour_data.datetime | as_datetime }}"
+                schedule_index: "{{ 4 + repeat.index - 1 }}"
+                discharging_speed: "{{ discharging_speeds[repeat.index - 1] }}"
+                is_last_hour: "{{ hour_data.datetime == last_expensive_hour_datetime }}"
+                time_from: "{{ ((hour_data.datetime | as_datetime) - timedelta(minutes=1)).strftime('%H:%M') }}"
+                time_to_raw: "{{ ((hour_data.datetime | as_datetime) + timedelta(hours=1) - timedelta(minutes=1)).strftime('%H:%M') }}"
+                time_to: "{{ ((hour_data.datetime | as_datetime) + timedelta(hours=1) + timedelta(minutes=20)).strftime('%H:%M') if is_last_hour else time_to_raw }}"
+                schedule_weekday: "{{ (hour_data.datetime | as_datetime).weekday() }}"
+
+            - service: script.set_schedule_period
+              data:
+                device_prefix: "{{ device_prefix }}"
+                schedule_index: "{{ schedule_index }}"
+                time_from: "{{ time_from }}"
+                time_to: "{{ time_to }}"
+                power: "{{ discharging_speed }}"
+                weekday: "{{ schedule_weekday }}"
+                enabled: true
+                delay_seconds: "{{ delay_seconds_between_actions }}"
+
+            - service: system_log.write
+              data:
+                message: >
+                  Schedule {{ schedule_index }} DISCHARGE:
+                  {{ time_from }}-{{ time_to }},
+                  {{ (hour_data.price / 10000000) | round(4) }} EUR,
+                  {{ discharging_speed }}W
+                level: info
+
+      # Store timing helpers
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.first_charge_hour_start
+        data:
+          datetime: "{{ first_cheap_hour_datetime if first_cheap_hour_datetime else now().isoformat() }}"
+
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.last_charge_hour_start
+        data:
+          datetime: "{{ last_cheap_hour_datetime if last_cheap_hour_datetime else now().isoformat() }}"
+
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.first_discharge_hour_start
+        data:
+          datetime: "{{ first_expensive_hour_datetime if first_expensive_hour_datetime else now().isoformat() }}"
+
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.last_discharge_hour_start
+        data:
+          datetime: "{{ last_expensive_hour_datetime if last_expensive_hour_datetime else now().isoformat() }}"
+
+automation:
+  # Turn on battery before first charge
+  - id: marstek_turn_on_battery_before_charging
+    alias: "Marstek Battery Turn on 3 minutes before charging"
+    trigger:
+      - platform: template
+        value_template: >
+          {% if states('input_datetime.first_charge_hour_start') != 'unknown' %}
+            {% set target_time = states('input_datetime.first_charge_hour_start') | as_datetime - timedelta(minutes=3) %}
+            {{ now() >= target_time and 
+               (now() - target_time).total_seconds() < 60 and
+               is_state('switch.energy_socket_2', 'off') }}
+          {% else %}
+            false
+          {% endif %}
+    action:
+      - service: switch.turn_on
+        target:
+          entity_id: switch.energy_socket_2
+
+  # Turn off when power is too low
+  - id: marstek_turn_off_low_power_charging
+    alias: "Marstek Battery Turn off charging when power is too low"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.energy_socket_power_2
+        below: 10
+        for:
+          minutes: 5
+    condition:
+      - condition: state
+        entity_id: switch.energy_socket_2
+        state: "on"
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.energy_socket_2
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ now().hour > 18 }}"
+            sequence:
+              - service: script.marstek_battery_main_control
+
+  # Trigger main control when tomorrow's prices become available
+  - id: marstek_prices_available_trigger
+    alias: "Marstek Battery Trigger on Tomorrow Prices"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.tomorrow_prices_available
+        to: "on"
+    action:
+      - service: script.marstek_battery_main_control
+
+  # Daily trigger for main control
+  - id: marstek_daily_control_trigger
+    alias: "Marstek Battery Daily Control midnight"
+    trigger:
+      - platform: time
+        at: "00:30:00"
+    action:
+      - service: script.marstek_battery_main_control
+  - id: marstek_daily_control_trigger
+    alias: "Marstek Battery Daily Control morning"
+    trigger:
+      - platform: time
+        at: "10:30:00"
+    action:
+      - service: script.marstek_battery_main_control
+
+# Helper entities
+input_datetime:
+  first_charge_hour_start:
+    name: "Marstek Battery First Charge Hour Start Time"
+    has_date: true
+    has_time: true
+
+  last_charge_hour_start:
+    name: "Marstek Battery Last Charge Hour Start Time"
+    has_date: true
+    has_time: true
+
+  first_discharge_hour_start:
+    name: "Marstek Battery First Discharge Hour Start Time"
+    has_date: true
+    has_time: true
+
+  last_discharge_hour_start:
+    name: "Marstek Battery Last Discharge Hour Start Time"
+    has_date: true
+    has_time: true
